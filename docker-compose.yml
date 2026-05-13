@@ -1,0 +1,13 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: dts
+      POSTGRES_PASSWORD: dts
+      POSTGRES_DB: dts
+    ports:
+      - "5432:5432"
+    volumes:
+      - dts_db:/var/lib/postgresql/data
+volumes:
+  dts_db: {}

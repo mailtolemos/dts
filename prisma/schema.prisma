@@ -1,0 +1,299 @@
+// DTS — Prisma schema
+// See docs/03-data-model.md for narrative.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------- Enums ----------
+enum AssetClass {
+  CRYPTO
+  EQUITY
+  INDEX
+  COMMODITY
+  FX
+  RATE
+}
+
+enum ProviderKind {
+  PYTH
+  COINGECKO
+  POLYGON
+  FRED
+  MOCK
+}
+
+enum Bias {
+  BULLISH
+  BEARISH
+  NEUTRAL
+  WATCH
+}
+
+enum Horizon {
+  INTRADAY
+  SWING
+  MULTIWEEK
+}
+
+enum Confidence {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum Trend {
+  UP
+  DOWN
+  SIDEWAYS
+}
+
+enum Regime {
+  RISK_ON
+  RISK_OFF
+  CHOPPY
+  VOL_EXPANSION
+  VOL_COMPRESSION
+  CRYPTO_LED
+  EQUITY_LED
+  MACRO_LED
+  NEWS_DRIVEN
+}
+
+enum AlertType {
+  PRICE_CROSS
+  PCT_MOVE
+  VOL_EXPANSION
+  THESIS_CHANGE
+  TREND_CHANGE
+  NEWS_EVENT
+}
+
+enum Impact {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum Factuality {
+  CONFIRMED
+  REPORTED
+  RUMOR
+  OPINION
+}
+
+enum LogLevel {
+  INFO
+  WARN
+  ERROR
+}
+
+// ---------- Tables ----------
+
+model User {
+  id          String      @id @default(cuid())
+  email       String?     @unique
+  displayName String?
+  prefs       Json?
+  createdAt   DateTime    @default(now())
+
+  favorites   Favorite[]
+  watchlists  Watchlist[]
+  alerts      Alert[]
+}
+
+model Asset {
+  id         String       @id @default(cuid())
+  symbol     String       @unique
+  name       String
+  assetClass AssetClass
+  metadata   Json?
+
+  feeds      PriceFeed[]
+  favorites  Favorite[]
+  watchItems WatchlistItem[]
+  alerts     Alert[]
+  snapshots  AssetSnapshot[]
+  analyses   AiAnalysis[]
+  signals    SignalHistory[]
+  news       NewsAssetLink[]
+}
+
+model PriceFeed {
+  id            String        @id @default(cuid())
+  assetId       String
+  providerId    String        @unique
+  provider      ProviderKind
+  displaySymbol String
+  decimals      Int           @default(8)
+  active        Boolean       @default(true)
+
+  asset Asset @relation(fields: [assetId], references: [id], onDelete: Cascade)
+}
+
+model Favorite {
+  userId    String
+  assetId   String
+  createdAt DateTime @default(now())
+
+  user  User  @relation(fields: [userId],  references: [id], onDelete: Cascade)
+  asset Asset @relation(fields: [assetId], references: [id], onDelete: Cascade)
+
+  @@id([userId, assetId])
+}
+
+model Watchlist {
+  id     String          @id @default(cuid())
+  userId String
+  name   String
+  order  Int             @default(0)
+  items  WatchlistItem[]
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model WatchlistItem {
+  watchlistId String
+  assetId     String
+  order       Int        @default(0)
+
+  watchlist Watchlist @relation(fields: [watchlistId], references: [id], onDelete: Cascade)
+  asset     Asset     @relation(fields: [assetId],     references: [id], onDelete: Cascade)
+
+  @@id([watchlistId, assetId])
+}
+
+model Alert {
+  id              String     @id @default(cuid())
+  userId          String
+  assetId         String?
+  type            AlertType
+  params          Json
+  enabled         Boolean    @default(true)
+  lastTriggeredAt DateTime?
+  createdAt       DateTime   @default(now())
+
+  user   User    @relation(fields: [userId],  references: [id], onDelete: Cascade)
+  asset  Asset?  @relation(fields: [assetId], references: [id], onDelete: SetNull)
+  events AlertEvent[]
+}
+
+model AlertEvent {
+  id      String   @id @default(cuid())
+  alertId String
+  firedAt DateTime @default(now())
+  payload Json
+
+  alert Alert @relation(fields: [alertId], references: [id], onDelete: Cascade)
+}
+
+model MarketSnapshot {
+  id            String   @id @default(cuid())
+  at            DateTime @default(now())
+  regime        Regime
+  riskScore     Float
+  vix           Float?
+  dxy           Float?
+  btcDominance  Float?
+  summary       String
+  inputs        Json
+
+  @@index([at])
+}
+
+model AssetSnapshot {
+  id        String   @id @default(cuid())
+  assetId   String
+  at        DateTime @default(now())
+  last      Float
+  change24h Float?
+  rsi14     Float?
+  macd      Json?
+  atr14     Float?
+  bb        Json?
+  sma50     Float?
+  sma200    Float?
+  ema20     Float?
+  trend     Trend     @default(SIDEWAYS)
+  levels    Json?
+  features  Json?
+
+  asset Asset @relation(fields: [assetId], references: [id], onDelete: Cascade)
+
+  @@index([assetId, at])
+}
+
+model AiAnalysis {
+  id              String     @id @default(cuid())
+  assetId         String
+  at              DateTime   @default(now())
+  bias            Bias
+  horizon         Horizon
+  confidence      Confidence
+  reasoning       String
+  keyLevels       Json
+  riskNotes       String
+  whatChangesView String
+  sourcesUsed     Json
+  model           String
+  inputsHash      String
+
+  asset Asset @relation(fields: [assetId], references: [id], onDelete: Cascade)
+
+  @@index([assetId, at])
+}
+
+model NewsItem {
+  id          String      @id @default(cuid())
+  url         String      @unique
+  source      String
+  title       String
+  summary     String?
+  publishedAt DateTime
+  impact      Impact      @default(LOW)
+  factuality  Factuality  @default(REPORTED)
+  secondOrder String?
+
+  links NewsAssetLink[]
+
+  @@index([publishedAt])
+}
+
+model NewsAssetLink {
+  newsItemId String
+  assetId    String
+  weight     Float     @default(1)
+
+  news  NewsItem @relation(fields: [newsItemId], references: [id], onDelete: Cascade)
+  asset Asset    @relation(fields: [assetId],    references: [id], onDelete: Cascade)
+
+  @@id([newsItemId, assetId])
+}
+
+model SignalHistory {
+  id      String   @id @default(cuid())
+  assetId String
+  kind    String
+  at      DateTime @default(now())
+  payload Json
+
+  asset Asset @relation(fields: [assetId], references: [id], onDelete: Cascade)
+
+  @@index([assetId, at])
+}
+
+model SystemLog {
+  id      String   @id @default(cuid())
+  level   LogLevel
+  source  String
+  message String
+  meta    Json?
+  at      DateTime @default(now())
+
+  @@index([at])
+}
