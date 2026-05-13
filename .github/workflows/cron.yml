@@ -6,11 +6,14 @@ on:
     - cron: '*/15 * * * *'   # every 15 min — analyst + news
   workflow_dispatch:           # manual trigger from Actions tab
 
-# Concurrency: don't pile up runs if a previous one is slow.
 concurrency:
   group: dts-cron-${{ github.event.schedule }}
   cancel-in-progress: false
 
+# All steps reuse this snippet — we keep them inline because GitHub Actions
+# composite actions can't read repo-level vars/secrets without extra plumbing.
+# The pattern: --fail-with-body shows the body even on non-2xx, and the
+# `|| { echo "$BODY"; exit 1; }` propagates the failure so a 401 fails the job.
 jobs:
   refresh-and-regime:
     if: github.event.schedule == '*/5 * * * *' || github.event_name == 'workflow_dispatch'
@@ -21,18 +24,22 @@ jobs:
         env:
           DTS_URL: ${{ vars.DTS_URL }}
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        shell: bash
         run: |
-          curl -sSf -X POST "$DTS_URL/api/cron/refresh" \
-            -H "Authorization: Bearer $CRON_SECRET" \
-            --max-time 90 | jq .
+          set -euo pipefail
+          BODY=$(curl --fail-with-body -sS -X POST "$DTS_URL/api/cron/refresh" \
+            -H "Authorization: Bearer $CRON_SECRET" --max-time 90) || { echo "FAILED: $BODY"; exit 1; }
+          echo "$BODY" | jq .
       - name: regime
         env:
           DTS_URL: ${{ vars.DTS_URL }}
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        shell: bash
         run: |
-          curl -sSf -X POST "$DTS_URL/api/cron/regime" \
-            -H "Authorization: Bearer $CRON_SECRET" \
-            --max-time 45 | jq .
+          set -euo pipefail
+          BODY=$(curl --fail-with-body -sS -X POST "$DTS_URL/api/cron/regime" \
+            -H "Authorization: Bearer $CRON_SECRET" --max-time 45) || { echo "FAILED: $BODY"; exit 1; }
+          echo "$BODY" | jq .
 
   analyst-and-news:
     if: github.event.schedule == '*/15 * * * *' || github.event_name == 'workflow_dispatch'
@@ -43,15 +50,19 @@ jobs:
         env:
           DTS_URL: ${{ vars.DTS_URL }}
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        shell: bash
         run: |
-          curl -sSf -X POST "$DTS_URL/api/cron/analyst" \
-            -H "Authorization: Bearer $CRON_SECRET" \
-            --max-time 90 | jq .
+          set -euo pipefail
+          BODY=$(curl --fail-with-body -sS -X POST "$DTS_URL/api/cron/analyst" \
+            -H "Authorization: Bearer $CRON_SECRET" --max-time 90) || { echo "FAILED: $BODY"; exit 1; }
+          echo "$BODY" | jq .
       - name: news
         env:
           DTS_URL: ${{ vars.DTS_URL }}
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        shell: bash
         run: |
-          curl -sSf -X POST "$DTS_URL/api/cron/news" \
-            -H "Authorization: Bearer $CRON_SECRET" \
-            --max-time 90 | jq .
+          set -euo pipefail
+          BODY=$(curl --fail-with-body -sS -X POST "$DTS_URL/api/cron/news" \
+            -H "Authorization: Bearer $CRON_SECRET" --max-time 90) || { echo "FAILED: $BODY"; exit 1; }
+          echo "$BODY" | jq .
