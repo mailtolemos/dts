@@ -12,7 +12,7 @@ export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
 
 const TOP_SYMBOLS = ['BTC','ETH','SOL','XRP','BNB','ADA','AVAX','DOGE','LINK','SPX','NDX','XAU','VIX','EURUSD','DXY'];
-const BATCH_SIZE = 5;
+const BATCH_SIZE = 2;
 
 export async function POST(req: NextRequest) { return run(req); }
 export async function GET(req: NextRequest)  { return run(req); }
