@@ -1,0 +1,57 @@
+name: DTS cron
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'    # every 5 min — refresh + regime
+    - cron: '*/15 * * * *'   # every 15 min — analyst + news
+  workflow_dispatch:           # manual trigger from Actions tab
+
+# Concurrency: don't pile up runs if a previous one is slow.
+concurrency:
+  group: dts-cron-${{ github.event.schedule }}
+  cancel-in-progress: false
+
+jobs:
+  refresh-and-regime:
+    if: github.event.schedule == '*/5 * * * *' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: refresh
+        env:
+          DTS_URL: ${{ vars.DTS_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          curl -sSf -X POST "$DTS_URL/api/cron/refresh" \
+            -H "Authorization: Bearer $CRON_SECRET" \
+            --max-time 90 | jq .
+      - name: regime
+        env:
+          DTS_URL: ${{ vars.DTS_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          curl -sSf -X POST "$DTS_URL/api/cron/regime" \
+            -H "Authorization: Bearer $CRON_SECRET" \
+            --max-time 45 | jq .
+
+  analyst-and-news:
+    if: github.event.schedule == '*/15 * * * *' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: analyst (rotating batch)
+        env:
+          DTS_URL: ${{ vars.DTS_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          curl -sSf -X POST "$DTS_URL/api/cron/analyst" \
+            -H "Authorization: Bearer $CRON_SECRET" \
+            --max-time 90 | jq .
+      - name: news
+        env:
+          DTS_URL: ${{ vars.DTS_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          curl -sSf -X POST "$DTS_URL/api/cron/news" \
+            -H "Authorization: Bearer $CRON_SECRET" \
+            --max-time 90 | jq .

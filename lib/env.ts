@@ -13,6 +13,7 @@ const EnvSchema = z.object({
   COINGECKO_API_KEY: z.string().optional().default(''),
   AUTH_ENABLED: z.string().default('0'),
   DTS_USER_EMAIL: z.string().email().default('you@example.com'),
+  CRON_SECRET: z.string().optional().default(''),
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
 });
