@@ -3,15 +3,11 @@ import { env, flags } from '../env';
 import { logger } from '../logger';
 import { priceCache } from '../cache';
 import type { PriceTick } from '../types';
-import { mockTick } from './mock';
 
-// Subset of Pyth Hermes catalog. Real seed pulls full list at install time.
-export interface PythFeed {
-  id: string;             // hex feed id
-  symbol: string;         // e.g. "Crypto.BTC/USD"
-  displaySymbol: string;  // "BTC/USD"
-  assetType: 'crypto' | 'equity' | 'fx' | 'metal' | 'rates' | 'commodities';
-}
+// Pyth Hermes price feed client. Real data only — no mocks.
+//
+// Free public Hermes works without a key (rate-limited). Pyth Pro key
+// (PYTH_API_KEY) extends limits and is sent as Authorization: Bearer.
 
 const throttle = pThrottle({ limit: 20, interval: 1_000 });
 
@@ -20,20 +16,33 @@ function authHeaders(): Record<string, string> {
   return key ? { Authorization: `Bearer ${key}` } : {};
 }
 
+export interface HermesFeedRow {
+  id: string;
+  attributes: {
+    asset_type: string;
+    base: string;
+    quote_currency: string;
+    description: string;
+    display_symbol: string;
+    symbol: string;
+    country?: string;
+    schedule?: string;
+  };
+}
+
 interface HermesPriceUpdate {
   id: string;
   price: { price: string; conf: string; expo: number; publish_time: number };
-  ema_price?: { price: string; conf: string; expo: number; publish_time: number };
 }
+
+// === Latest prices ===
 
 const _fetchLatest = throttle(async (ids: string[]): Promise<HermesPriceUpdate[]> => {
   const params = new URLSearchParams();
   ids.forEach((id) => params.append('ids[]', id));
   const url = `${env().PYTH_HERMES_URL}/v2/updates/price/latest?${params.toString()}`;
   const r = await fetch(url, { headers: authHeaders(), cache: 'no-store' });
-  if (!r.ok) {
-    throw new Error(`pyth ${r.status} ${await r.text().catch(() => '')}`);
-  }
+  if (!r.ok) throw new Error(`pyth ${r.status} ${await r.text().catch(() => '')}`);
   const json = await r.json() as { parsed?: HermesPriceUpdate[] };
   return json.parsed ?? [];
 });
@@ -41,9 +50,9 @@ const _fetchLatest = throttle(async (ids: string[]): Promise<HermesPriceUpdate[]
 function normalize(u: HermesPriceUpdate, symbol: string): PriceTick {
   const scale = Math.pow(10, u.price.expo);
   const price = Number(u.price.price) * scale;
-  const conf  = Number(u.price.conf)  * scale;
-  const ageS  = Math.floor(Date.now() / 1000) - u.price.publish_time;
-  const stale = ageS > 30 || conf / Math.max(price, 1) > 0.005;
+  const conf = Number(u.price.conf) * scale;
+  const ageS = Math.floor(Date.now() / 1000) - u.price.publish_time;
+  const stale = ageS > 60 || conf / Math.max(price, 1) > 0.005;
   return {
     feedId: u.id,
     symbol,
@@ -57,7 +66,7 @@ function normalize(u: HermesPriceUpdate, symbol: string): PriceTick {
 
 export interface FeedLookup { feedId: string; symbol: string }
 
-/** Fetch latest ticks for a list of feeds. Falls back to mock per-feed if Pyth fails. */
+/** Fetch latest ticks for a list of feeds. Returns only feeds that succeeded. */
 export async function getLatest(feeds: FeedLookup[]): Promise<PriceTick[]> {
   if (feeds.length === 0) return [];
   // Serve cached ticks first.
@@ -69,26 +78,46 @@ export async function getLatest(feeds: FeedLookup[]): Promise<PriceTick[]> {
   }
   if (need.length === 0) return out;
 
-  try {
-    // Batch into 50-id chunks.
-    const chunks: FeedLookup[][] = [];
-    for (let i = 0; i < need.length; i += 50) chunks.push(need.slice(i, i + 50));
-    for (const chunk of chunks) {
+  // Batch into 50-id chunks; Pyth accepts up to 50 ids/request.
+  const chunks: FeedLookup[][] = [];
+  for (let i = 0; i < need.length; i += 50) chunks.push(need.slice(i, i + 50));
+
+  // Run chunks in parallel.
+  const results = await Promise.allSettled(
+    chunks.map(async (chunk) => {
       const updates = await _fetchLatest(chunk.map((c) => c.feedId));
       const bySymbol = new Map(chunk.map((c) => [c.feedId.toLowerCase(), c.symbol]));
+      const ticks: PriceTick[] = [];
       for (const u of updates) {
         const sym = bySymbol.get(u.id.toLowerCase()) ?? u.id;
         const tick = normalize(u, sym);
         priceCache.set(`pyth:${tick.feedId}`, tick, 1_000);
-        out.push(tick);
+        ticks.push(tick);
       }
-    }
-    return out;
-  } catch (err) {
-    logger.warn({ err: String(err) }, 'pyth getLatest failed; returning mocks');
-    return [...out, ...need.map((f) => mockTick(f.symbol, f.feedId))];
+      return ticks;
+    }),
+  );
+  for (const r of results) {
+    if (r.status === 'fulfilled') out.push(...r.value);
+    else logger.warn({ err: String(r.reason) }, 'pyth chunk failed');
   }
+  return out;
 }
+
+// === Catalog ===
+
+/**
+ * Fetch the full Pyth price-feed catalog from Hermes. Used by the catalog
+ * sync cron + seed.
+ */
+export async function listAllFeeds(): Promise<HermesFeedRow[]> {
+  const url = `${env().PYTH_HERMES_URL}/v2/price_feeds`;
+  const r = await fetch(url, { headers: authHeaders(), cache: 'no-store' });
+  if (!r.ok) throw new Error(`pyth catalog ${r.status}`);
+  return (await r.json()) as HermesFeedRow[];
+}
+
+// === Streaming ===
 
 /** Subscribe to Pyth SSE. Returns an unsubscribe function. */
 export function streamTicks(
@@ -96,15 +125,7 @@ export function streamTicks(
   onTick: (t: PriceTick) => void,
 ): () => void {
   if (feeds.length === 0) return () => {};
-  if (!flags.hasPyth && env().NODE_ENV !== 'production') {
-    // Dev/mock mode: emit random walks every 2s.
-    const interval = setInterval(() => {
-      for (const f of feeds) onTick(mockTick(f.symbol, f.feedId));
-    }, 2_000);
-    return () => clearInterval(interval);
-  }
 
-  // Lazy-load eventsource (it's a Node lib, not browser).
   let closed = false;
   let es: { close(): void } | null = null;
 
@@ -146,12 +167,14 @@ export function streamTicks(
 /** Health check used by /api/admin/health. */
 export async function health(): Promise<{ ok: boolean; lastError?: string }> {
   try {
-    await fetch(`${env().PYTH_HERMES_URL}/v2/price_feeds?asset_type=crypto&query=btc`, {
+    const r = await fetch(`${env().PYTH_HERMES_URL}/v2/price_feeds?asset_type=crypto&query=btc`, {
       headers: authHeaders(),
       cache: 'no-store',
     });
-    return { ok: true };
+    return { ok: r.ok, lastError: r.ok ? undefined : `status ${r.status}` };
   } catch (err) {
     return { ok: false, lastError: String(err) };
   }
 }
+
+export { flags };

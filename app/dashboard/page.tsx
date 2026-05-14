@@ -2,7 +2,8 @@ import { Panel, PanelHeader, Pill, Stat, fmtPct, fmtPrice, toneFromChange } from
 import Link from 'next/link';
 import { getDashboard } from '@/lib/services/market';
 
-export const dynamic = 'force-dynamic';
+// ISR: regenerate every 30s on demand. Each visit serves cached HTML.
+export const revalidate = 30;
 
 const REGIME_TONE: Record<string, 'bull' | 'bear' | 'warn' | 'neutral' | 'accent'> = {
   RISK_ON: 'bull', RISK_OFF: 'bear', CHOPPY: 'neutral',

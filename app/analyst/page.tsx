@@ -2,7 +2,7 @@ import { Panel, PanelHeader } from '@/components/ui';
 import IndicationCard from '@/components/IndicationCard';
 import { prisma } from '@/lib/db';
 
-export const dynamic = 'force-dynamic';
+export const revalidate = 30;
 
 export default async function AnalystPage() {
   const rows = await prisma.aiAnalysis.findMany({

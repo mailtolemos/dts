@@ -4,16 +4,13 @@ on:
   schedule:
     - cron: '*/5 * * * *'    # every 5 min — refresh + regime
     - cron: '*/15 * * * *'   # every 15 min — analyst + news
+    - cron: '0 6 * * *'      # daily 06:00 UTC — sync Pyth catalog
   workflow_dispatch:           # manual trigger from Actions tab
 
 concurrency:
   group: dts-cron-${{ github.event.schedule }}
   cancel-in-progress: false
 
-# All steps reuse this snippet — we keep them inline because GitHub Actions
-# composite actions can't read repo-level vars/secrets without extra plumbing.
-# The pattern: --fail-with-body shows the body even on non-2xx, and the
-# `|| { echo "$BODY"; exit 1; }` propagates the failure so a 401 fails the job.
 jobs:
   refresh-and-regime:
     if: github.event.schedule == '*/5 * * * *' || github.event_name == 'workflow_dispatch'
@@ -21,9 +18,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: refresh
-        env:
-          DTS_URL: ${{ vars.DTS_URL }}
-          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        env: { DTS_URL: '${{ vars.DTS_URL }}', CRON_SECRET: '${{ secrets.CRON_SECRET }}' }
         shell: bash
         run: |
           set -euo pipefail
@@ -31,9 +26,7 @@ jobs:
             -H "Authorization: Bearer $CRON_SECRET" --max-time 90) || { echo "FAILED: $BODY"; exit 1; }
           echo "$BODY" | jq .
       - name: regime
-        env:
-          DTS_URL: ${{ vars.DTS_URL }}
-          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        env: { DTS_URL: '${{ vars.DTS_URL }}', CRON_SECRET: '${{ secrets.CRON_SECRET }}' }
         shell: bash
         run: |
           set -euo pipefail
@@ -47,9 +40,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: analyst (rotating batch)
-        env:
-          DTS_URL: ${{ vars.DTS_URL }}
-          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        env: { DTS_URL: '${{ vars.DTS_URL }}', CRON_SECRET: '${{ secrets.CRON_SECRET }}' }
         shell: bash
         run: |
           set -euo pipefail
@@ -57,12 +48,24 @@ jobs:
             -H "Authorization: Bearer $CRON_SECRET" --max-time 90) || { echo "FAILED: $BODY"; exit 1; }
           echo "$BODY" | jq .
       - name: news
-        env:
-          DTS_URL: ${{ vars.DTS_URL }}
-          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        env: { DTS_URL: '${{ vars.DTS_URL }}', CRON_SECRET: '${{ secrets.CRON_SECRET }}' }
         shell: bash
         run: |
           set -euo pipefail
           BODY=$(curl --fail-with-body -sS -X POST "$DTS_URL/api/cron/news" \
             -H "Authorization: Bearer $CRON_SECRET" --max-time 90) || { echo "FAILED: $BODY"; exit 1; }
+          echo "$BODY" | jq .
+
+  sync-catalog:
+    if: github.event.schedule == '0 6 * * *' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: sync Pyth catalog
+        env: { DTS_URL: '${{ vars.DTS_URL }}', CRON_SECRET: '${{ secrets.CRON_SECRET }}' }
+        shell: bash
+        run: |
+          set -euo pipefail
+          BODY=$(curl --fail-with-body -sS -X POST "$DTS_URL/api/cron/sync-catalog" \
+            -H "Authorization: Bearer $CRON_SECRET" --max-time 300) || { echo "FAILED: $BODY"; exit 1; }
           echo "$BODY" | jq .

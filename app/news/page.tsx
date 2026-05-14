@@ -2,7 +2,7 @@ import { Panel, PanelHeader, Pill } from '@/components/ui';
 import { getNews } from '@/lib/providers/cryptopanic';
 import { prisma } from '@/lib/db';
 
-export const dynamic = 'force-dynamic';
+export const revalidate = 60;
 
 const IMPACT_TONE: Record<string, 'bull' | 'bear' | 'warn' | 'neutral' | 'accent'> = {
   HIGH: 'warn', MEDIUM: 'accent', LOW: 'neutral',

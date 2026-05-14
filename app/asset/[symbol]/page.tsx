@@ -5,7 +5,7 @@ import PriceChart from '@/components/PriceChart';
 import RegenButton from '@/components/RegenButton';
 import { getAssetBundle } from '@/lib/services/market';
 
-export const dynamic = 'force-dynamic';
+export const revalidate = 60;
 
 export default async function AssetPage({ params }: { params: { symbol: string } }) {
   const symbol = params.symbol.toUpperCase();
@@ -21,10 +21,12 @@ export default async function AssetPage({ params }: { params: { symbol: string }
             <div className="text-2xl font-semibold">{b.asset.symbol}</div>
             <div className="text-sm text-muted">{b.asset.name}</div>
             <Pill>{b.asset.assetClass}</Pill>
-            {b.price.stale ? <Pill tone="warn">stale</Pill> : <Pill tone="accent">{b.price.source}</Pill>}
+            {b.price?.stale ? <Pill tone="warn">stale</Pill>
+              : b.price ? <Pill tone="accent">{b.price.source}</Pill>
+              : <Pill tone="warn">no price</Pill>}
           </div>
-          <div className="mt-1 mono tabular text-3xl">{fmtPrice(b.price.last)}
-            <span className="text-xs text-muted ml-2">±{fmtPrice(b.price.conf)}</span>
+          <div className="mt-1 mono tabular text-3xl">{b.price ? fmtPrice(b.price.last) : '—'}
+            {b.price ? <span className="text-xs text-muted ml-2">±{fmtPrice(b.price.conf)}</span> : null}
           </div>
         </div>
         <div className="flex items-center gap-2">

@@ -1,7 +1,8 @@
-// Composition layer used by API routes and worker.
+// Composition layer used by API routes and cron endpoints.
+// Real data only — no mock fallbacks. Pages serve from cached snapshots
+// (DB / ISR) for speed; the cron writes fresh data.
 import { prisma } from '../db';
 import { getLatest, type FeedLookup } from '../providers/pyth';
-import { mockTick } from '../providers/mock';
 import { getOhlc } from '../providers/coingecko';
 import { getAllMacro } from '../providers/fred';
 import { getFearGreed } from '../providers/sentiment';
@@ -12,39 +13,30 @@ import { findLevels, classifyStructure } from '../analysis/levels';
 import { classifyRegime, riskScore } from '../analysis/regime';
 import { runAnalyst } from '../ai/analyst';
 import { marketSummary } from '../ai/news';
-import { UNIVERSE, findUniverse } from '../universe';
 import { cardBus, priceBus } from '../alerts/bus';
 import type { PriceTick, Trend, Regime } from '../types';
 
-/** Build a fake feedId for assets we know via Pyth symbol but haven't resolved hex id yet. */
-function feedIdFor(symbol: string): string {
-  return `mock-${symbol.toLowerCase()}`;
-}
-
-/** Pull live prices for every asset in the DB (or universe if DB empty). */
+/** Pull live prices for every asset in DB that has a PYTH feed. */
 export async function getAllPrices(): Promise<PriceTick[]> {
-  const assets = await prisma.asset.findMany({ include: { feeds: true } });
-  const list = assets.length ? assets : UNIVERSE.map((u) => ({ symbol: u.symbol, name: u.name, assetClass: u.assetClass, feeds: [] }));
-
+  const assets = await prisma.asset.findMany({
+    include: { feeds: { where: { provider: 'PYTH', active: true } } },
+  });
   const feeds: FeedLookup[] = [];
-  for (const a of list) {
-    const pyth = (a as { feeds?: Array<{ provider: string; providerId: string }> }).feeds?.find((f) => f.provider === 'PYTH');
-    if (pyth) feeds.push({ feedId: pyth.providerId, symbol: a.symbol });
+  for (const a of assets) {
+    const f = a.feeds[0];
+    if (!f) continue;
+    feeds.push({ feedId: f.providerId, symbol: a.symbol });
   }
-
-  const pythTicks = await getLatest(feeds);
-  const got = new Map(pythTicks.map((t) => [t.symbol, t]));
-
-  // Fill missing with mocks so the UI is never empty.
-  const out: PriceTick[] = list.map((a) => got.get(a.symbol) ?? mockTick(a.symbol, feedIdFor(a.symbol)));
-  // Emit to SSE bus so anyone listening can rebroadcast.
-  for (const t of out) priceBus.emit({ symbol: t.symbol, last: t.price, conf: t.conf, at: new Date(t.publishTime * 1000).toISOString() });
-  return out;
+  const ticks = await getLatest(feeds);
+  for (const t of ticks) {
+    priceBus.emit({ symbol: t.symbol, last: t.price, conf: t.conf, at: new Date(t.publishTime * 1000).toISOString() });
+  }
+  return ticks;
 }
 
 export interface AssetBundle {
   asset: { symbol: string; name: string; assetClass: string };
-  price: { last: number; conf: number; updatedAt: string; stale: boolean; source: string };
+  price: { last: number; conf: number; updatedAt: string; stale: boolean; source: string } | null;
   ohlc: Array<{ t: number; o: number; h: number; l: number; c: number; v?: number }>;
   indicators: ReturnType<typeof computeIndicators>;
   levels: { support: number[]; resistance: number[] };
@@ -57,44 +49,45 @@ export interface AssetBundle {
 }
 
 export async function getAssetBundle(symbol: string): Promise<AssetBundle | null> {
-  const universe = findUniverse(symbol);
-  if (!universe) return null;
+  const asset = await prisma.asset.findUnique({
+    where: { symbol },
+    include: { feeds: { where: { provider: 'PYTH', active: true } } },
+  });
+  if (!asset) return null;
 
-  // Load or stub the DB row.
-  const dbAsset = await prisma.asset.findUnique({ where: { symbol } }).catch(() => null);
-  const ticks = await getAllPrices();
-  const tick = ticks.find((t) => t.symbol === symbol) ?? mockTick(symbol, feedIdFor(symbol));
+  const pythFeed = asset.feeds[0];
+  const ticks = pythFeed
+    ? await getLatest([{ feedId: pythFeed.providerId, symbol }])
+    : [];
+  const tick = ticks[0] ?? null;
 
+  // OHLC only available for symbols mapped in CoinGecko (currently crypto).
   const ohlc = await getOhlc(symbol, 180);
-  const ind  = computeIndicators(ohlc);
-  const lv   = findLevels(ohlc);
+  const ind = computeIndicators(ohlc);
+  const lv = findLevels(ohlc);
   const structure = classifyStructure(ohlc);
-  const trend: Trend = (ind.sma50 != null && ind.sma200 != null)
+  const trend: Trend = (tick && ind.sma50 != null && ind.sma200 != null)
     ? (tick.price > ind.sma50 && tick.price > ind.sma200 ? 'UP'
       : tick.price < ind.sma50 && tick.price < ind.sma200 ? 'DOWN' : 'SIDEWAYS')
     : 'SIDEWAYS';
 
-  // Latest card if any.
-  let cardRow = null;
-  if (dbAsset) {
-    cardRow = await prisma.aiAnalysis.findFirst({
-      where: { assetId: dbAsset.id }, orderBy: { at: 'desc' },
-    });
-  }
+  const cardRow = await prisma.aiAnalysis.findFirst({
+    where: { assetId: asset.id }, orderBy: { at: 'desc' },
+  });
 
-  // News for this asset.
-  const allNews = await getNews(universe.assetClass === 'CRYPTO' ? { currency: symbol } : {});
+  // News with this asset symbol mentioned.
+  const allNews = await getNews(asset.assetClass === 'CRYPTO' ? { currency: symbol } : {});
   const news = allNews
     .filter((n) => !n.currencies || n.currencies.length === 0 || n.currencies.includes(symbol))
     .slice(0, 8)
     .map((n) => ({ id: n.id, title: n.title, url: n.url, source: n.source, publishedAt: n.publishedAt }));
 
   return {
-    asset: { symbol: universe.symbol, name: universe.name, assetClass: universe.assetClass },
-    price: {
+    asset: { symbol: asset.symbol, name: asset.name, assetClass: asset.assetClass },
+    price: tick ? {
       last: tick.price, conf: tick.conf, source: tick.source, stale: tick.stale,
       updatedAt: new Date(tick.publishTime * 1000).toISOString(),
-    },
+    } : null,
     ohlc,
     indicators: ind,
     levels: lv,
@@ -111,23 +104,23 @@ export async function getAssetBundle(symbol: string): Promise<AssetBundle | null
 }
 
 export async function regenerateCard(symbol: string): Promise<unknown> {
-  const universe = findUniverse(symbol);
-  if (!universe) throw new Error('ASSET_NOT_FOUND');
-
-  const dbAsset = await prisma.asset.upsert({
+  const asset = await prisma.asset.findUnique({
     where: { symbol },
-    create: { symbol, name: universe.name, assetClass: universe.assetClass },
-    update: {},
+    include: { feeds: { where: { provider: 'PYTH', active: true } } },
   });
+  if (!asset) throw new Error('ASSET_NOT_FOUND');
+  const pythFeed = asset.feeds[0];
+  if (!pythFeed) throw new Error('NO_FEED');
 
-  const ticks = await getAllPrices();
-  const tick = ticks.find((t) => t.symbol === symbol) ?? mockTick(symbol, feedIdFor(symbol));
+  const ticks = await getLatest([{ feedId: pythFeed.providerId, symbol }]);
+  const tick = ticks[0];
+  if (!tick) throw new Error('NO_PRICE');
+
   const ohlc = await getOhlc(symbol, 180);
   const macroRaw = await getAllMacro();
-  const fg = await getFearGreed();
 
   const regimeInputs = {
-    spxChange1d: pctChange(await getOhlc('BTC', 30).catch(() => ohlc), 1), // proxy
+    spxChange1d: null,
     btcChange1d: pctChange(ohlc, 1),
     vix: macroRaw.VIX, us10y: macroRaw.US10Y,
     highImpactNews: 0,
@@ -136,11 +129,11 @@ export async function regenerateCard(symbol: string): Promise<unknown> {
   const rs = riskScore(regimeInputs);
 
   const features = buildFeatures({
-    asset: { symbol: universe.symbol, name: universe.name, class: universe.assetClass },
+    asset: { symbol: asset.symbol, name: asset.name, class: asset.assetClass },
     tick, candles: ohlc,
     macro: { dxy: macroRaw.DXY, us10y: macroRaw.US10Y, vix: macroRaw.VIX },
     regime: { global: regime, riskScore: rs },
-    news: (await getNews(universe.assetClass === 'CRYPTO' ? { currency: symbol } : {}))
+    news: (await getNews(asset.assetClass === 'CRYPTO' ? { currency: symbol } : {}))
       .slice(0, 5)
       .map((n) => ({ title: n.title, impact: 'LOW', factuality: 'REPORTED', publishedAt: n.publishedAt })),
   });
@@ -149,7 +142,7 @@ export async function regenerateCard(symbol: string): Promise<unknown> {
 
   const saved = await prisma.aiAnalysis.create({
     data: {
-      assetId: dbAsset.id,
+      assetId: asset.id,
       bias: card.bias, horizon: card.horizon, confidence: card.confidence,
       reasoning: card.reasoning, keyLevels: card.keyLevels as never,
       riskNotes: card.riskNotes, whatChangesView: card.whatChangesView,
@@ -169,53 +162,71 @@ function pctChange(c: Array<{ c: number }>, lb: number): number | null {
   return ((b - a) / a) * 100;
 }
 
-export async function getDashboard() {
-  const ticks = await getAllPrices();
-  // Build per-asset 24h change from OHLC for the universe (cached aggressively in coingecko).
-  const changes = new Map<string, number>();
-  await Promise.all(UNIVERSE.slice(0, 30).map(async (u) => {
-    try {
-      const o = await getOhlc(u.symbol, 2);
-      if (o.length >= 2) {
-        const ch = ((o[o.length - 1]!.c - o[o.length - 2]!.c) / o[o.length - 2]!.c) * 100;
-        changes.set(u.symbol, ch);
-      }
-    } catch {/* ignore */}
-  }));
+interface MoverRow { symbol: string; name: string; last: number; change24h: number }
 
-  const byClass = (cls: string) => UNIVERSE
-    .filter((u) => u.assetClass === cls)
-    .map((u) => {
-      const t = ticks.find((x) => x.symbol === u.symbol);
-      return { symbol: u.symbol, name: u.name, last: t?.price ?? 0, change24h: changes.get(u.symbol) ?? 0 };
-    })
+/**
+ * Dashboard data — derived from DB snapshots written by the cron, so the
+ * page render is a fast pure-DB query. Falls back to live Pyth if the DB
+ * is empty.
+ */
+export async function getDashboard() {
+  // Latest snapshot per asset.
+  const assets = await prisma.asset.findMany({
+    include: {
+      snapshots: { orderBy: { at: 'desc' }, take: 1 },
+      feeds: { where: { provider: 'PYTH', active: true } },
+    },
+  });
+
+  // If we have live Pyth feeds, refresh prices for assets that have a feed.
+  const feedLookups: FeedLookup[] = [];
+  for (const a of assets) {
+    const f = a.feeds[0];
+    if (f) feedLookups.push({ feedId: f.providerId, symbol: a.symbol });
+  }
+  const liveTicks = await getLatest(feedLookups);
+  const liveBy = new Map(liveTicks.map((t) => [t.symbol, t]));
+
+  const rows: Array<{ symbol: string; name: string; assetClass: string; last: number; change24h: number }> = [];
+  for (const a of assets) {
+    const snap = a.snapshots[0];
+    const live = liveBy.get(a.symbol);
+    const last = live?.price ?? snap?.last ?? null;
+    if (last == null) continue;
+    rows.push({
+      symbol: a.symbol, name: a.name, assetClass: a.assetClass,
+      last,
+      change24h: snap?.change24h ?? 0,
+    });
+  }
+
+  const byClass = (cls: string): MoverRow[] => rows
+    .filter((r) => r.assetClass === cls)
+    .map((r) => ({ symbol: r.symbol, name: r.name, last: r.last, change24h: r.change24h }))
     .sort((a, b) => Math.abs(b.change24h) - Math.abs(a.change24h));
 
+  // Most recent global market snapshot drives regime + summary.
+  const latestRegime = await prisma.marketSnapshot.findFirst({ orderBy: { at: 'desc' } });
   const macro = await getAllMacro();
-  const news  = await getNews();
+  const fg = await getFearGreed();
 
-  const btcOhlc = await getOhlc('BTC', 2).catch(() => []);
-  const btcCh   = btcOhlc.length >= 2 ? ((btcOhlc[btcOhlc.length-1]!.c - btcOhlc[btcOhlc.length-2]!.c) / btcOhlc[btcOhlc.length-2]!.c) * 100 : 0;
-  const spxCh   = changes.get('SPX') ?? 0;
-
-  const regimeInputs = {
-    spxChange1d: spxCh, btcChange1d: btcCh,
-    vix: macro.VIX, us10y: macro.US10Y, dxyChange1d: 0, highImpactNews: 0,
-  };
-  const regime = classifyRegime(regimeInputs);
-  const rs     = riskScore(regimeInputs);
-  const fg     = await getFearGreed();
-
-  const summary = await marketSummary({
-    regime, riskScore: rs,
-    topMovers: byClass('CRYPTO').slice(0, 5).map((m) => ({ symbol: m.symbol, change24h: m.change24h })),
-    topNews: news.slice(0, 5).map((n) => n.title),
-    macro: { dxy: macro.DXY, us10y: macro.US10Y, vix: macro.VIX },
-  });
+  let summary = latestRegime?.summary ?? '';
+  if (!summary) {
+    const news = await getNews();
+    summary = await marketSummary({
+      regime: latestRegime?.regime ?? 'CHOPPY',
+      riskScore: latestRegime?.riskScore ?? 0,
+      topMovers: byClass('CRYPTO').slice(0, 5).map((m) => ({ symbol: m.symbol, change24h: m.change24h })),
+      topNews: news.slice(0, 5).map((n) => n.title),
+      macro: { dxy: macro.DXY, us10y: macro.US10Y, vix: macro.VIX },
+    });
+  }
 
   return {
     at: new Date().toISOString(),
-    regime, riskScore: rs, summary,
+    regime: latestRegime?.regime ?? 'CHOPPY',
+    riskScore: latestRegime?.riskScore ?? 0,
+    summary,
     classes: {
       crypto:    { topMovers: byClass('CRYPTO').slice(0, 5),    aggChange24h: avg(byClass('CRYPTO').map((m) => m.change24h)) },
       equityIdx: { topMovers: byClass('INDEX').slice(0, 5),     aggChange24h: avg(byClass('INDEX').map((m) => m.change24h)) },

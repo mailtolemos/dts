@@ -1,19 +1,20 @@
 import pThrottle from 'p-throttle';
-import { env, flags } from '../env';
+import { env } from '../env';
 import { logger } from '../logger';
 import { ohlcCache } from '../cache';
 import type { Candle } from '../types';
-import { mockCandles } from './mock';
 
-// CoinGecko free tier is enough for v1 OHLC on crypto.
+// CoinGecko free tier (10 RPM). Returns real data or empty array — no mocks.
 const BASE = 'https://api.coingecko.com/api/v3';
-const throttle = pThrottle({ limit: 10, interval: 60_000 });  // free tier: ~10 rpm
+const throttle = pThrottle({ limit: 10, interval: 60_000 });
 
 function headers(): Record<string, string> {
   const k = env().COINGECKO_API_KEY;
   return k ? { 'x-cg-demo-api-key': k } : {};
 }
 
+// Symbol → CoinGecko id. Only crypto symbols are mapped; equities/FX/etc.
+// return empty OHLC (use Pyth's own historical when we add it).
 const COINGECKO_IDS: Record<string, string> = {
   BTC: 'bitcoin', ETH: 'ethereum', SOL: 'solana', BNB: 'binancecoin', XRP: 'ripple',
   ADA: 'cardano', DOGE: 'dogecoin', AVAX: 'avalanche-2', LINK: 'chainlink', MATIC: 'matic-network',
@@ -35,9 +36,8 @@ export async function getOhlc(symbol: string, days = 180): Promise<Candle[]> {
 
   const id = COINGECKO_IDS[symbol];
   if (!id) {
-    const m = mockCandles(symbol, days);
-    ohlcCache.set(key, m);
-    return m;
+    // Not a CoinGecko-mapped symbol. Return empty rather than mock data.
+    return [];
   }
 
   try {
@@ -45,10 +45,10 @@ export async function getOhlc(symbol: string, days = 180): Promise<Candle[]> {
     ohlcCache.set(key, data);
     return data;
   } catch (err) {
-    logger.warn({ err: String(err), symbol }, 'coingecko OHLC failed; using mock');
-    const m = mockCandles(symbol, days);
-    ohlcCache.set(key, m, 60_000);
-    return m;
+    logger.warn({ err: String(err), symbol }, 'coingecko OHLC failed');
+    // Cache the empty result briefly so we don't hammer on rate-limit errors.
+    ohlcCache.set(key, [], 30_000);
+    return [];
   }
 }
 
@@ -60,5 +60,3 @@ export async function health(): Promise<{ ok: boolean; lastError?: string }> {
     return { ok: false, lastError: String(err) };
   }
 }
-
-export const hasKey = () => flags.hasGroq /* not relevant */ || true;

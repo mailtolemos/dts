@@ -3,11 +3,11 @@ import { env, flags } from '../env';
 import { logger } from '../logger';
 import { macroCache } from '../cache';
 
+// FRED (St. Louis Fed). Real data only — returns null when key missing or
+// fetch fails. No hard-coded fallbacks.
 const BASE = 'https://api.stlouisfed.org/fred';
 const throttle = pThrottle({ limit: 30, interval: 60_000 });
 
-// Series of interest: DXY (DTWEXBGS proxy), US10Y (DGS10), US02Y (DGS2), VIX (VIXCLS),
-// CPI YoY (CPIAUCSL), Unemp (UNRATE), Fed Funds (DFF).
 const SERIES = {
   DXY:   'DTWEXBGS',
   US10Y: 'DGS10',
@@ -33,38 +33,34 @@ const _fetch = throttle(async (id: string): Promise<{ date: string; value: numbe
     .filter((o) => !Number.isNaN(o.value));
 });
 
-const FALLBACK: Record<FredSeries, number> = {
-  DXY: 104.5, US10Y: 4.30, US02Y: 4.10, VIX: 13.5, CPI: 311.2, UNRATE: 4.0, DFF: 4.83,
-};
-
 export async function getLatest(series: FredSeries): Promise<number | null> {
   const key = `fred:${series}`;
-  const cached = macroCache.get(key) as number | undefined;
+  const cached = macroCache.get(key) as number | null | undefined;
   if (cached !== undefined) return cached;
-
-  if (!flags.hasFred) {
-    macroCache.set(key, FALLBACK[series], 60_000);
-    return FALLBACK[series];
-  }
+  if (!flags.hasFred) return null;
   try {
     const data = await _fetch(SERIES[series]);
-    const v = data[0]?.value ?? FALLBACK[series];
+    const v = data[0]?.value ?? null;
     macroCache.set(key, v);
     return v;
   } catch (err) {
-    logger.warn({ err: String(err), series }, 'fred fetch failed; using fallback');
-    return FALLBACK[series];
+    logger.warn({ err: String(err), series }, 'fred fetch failed');
+    macroCache.set(key, null, 60_000);
+    return null;
   }
 }
 
 export async function getAllMacro(): Promise<Record<FredSeries, number | null>> {
+  const keys = Object.keys(SERIES) as FredSeries[];
+  // Run in parallel; FRED handles bursts fine.
+  const values = await Promise.all(keys.map((k) => getLatest(k)));
   const out = {} as Record<FredSeries, number | null>;
-  for (const k of Object.keys(SERIES) as FredSeries[]) out[k] = await getLatest(k);
+  keys.forEach((k, i) => { out[k] = values[i]!; });
   return out;
 }
 
 export async function health(): Promise<{ ok: boolean; lastError?: string }> {
-  if (!flags.hasFred) return { ok: false, lastError: 'no key (fallback active)' };
+  if (!flags.hasFred) return { ok: false, lastError: 'no key' };
   try { await _fetch(SERIES.US10Y); return { ok: true }; }
   catch (err) { return { ok: false, lastError: String(err) }; }
 }
